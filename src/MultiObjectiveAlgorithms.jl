@@ -1,0 +1,1112 @@
+#  Copyright 2019, Oscar Dowson and contributors
+#  This Source Code Form is subject to the terms of the Mozilla Public License,
+#  v.2.0. If a copy of the MPL was not distributed with this file, You can
+#  obtain one at http://mozilla.org/MPL/2.0/.
+
+module MultiObjectiveAlgorithms
+
+import Combinatorics
+import MathOptInterface as MOI
+import Printf
+
+"""
+    struct SolutionPoint
+        x::Dict{MOI.VariableIndex,Float64}
+        y::Vector{Float64}
+    end
+
+The struct for representing a single solution point found by a multiobjective
+algorithm.
+
+The field `.x` is a mapping from decision variables to their primal values.
+
+The field `.y` is a vector of the corresponding objective value.
+"""
+struct SolutionPoint
+    x::Dict{MOI.VariableIndex,Float64}
+    y::Vector{Float64}
+end
+
+function Base.isapprox(a::SolutionPoint, b::SolutionPoint; kwargs...)
+    return isapprox(a.y, b.y; kwargs...)
+end
+
+Base.:(==)(a::SolutionPoint, b::SolutionPoint) = a.y == b.y
+
+function _dominates(
+    sense::MOI.OptimizationSense,
+    a::SolutionPoint,
+    b::SolutionPoint;
+    atol::Float64 = 1e-6,
+)
+    l, u = extrema(a.y - b.y)
+    if sense == MOI.MIN_SENSE
+        # At least one element must be strictly better => l < -atol
+        # No element can be structly worse => u <= atol
+        return l < -atol && u <= atol
+    else
+        # At least one element must be strictly better => u > atol
+        # No element can be structly worse => l >= -atol
+        return u > atol && l >= -atol
+    end
+end
+
+# The use of `atol` when sorting is to work-around a tolerance issue that caused
+# a test failure in #181 that wasn't reproducible on macOS. It happened on linux
+# because of a minor version change in HiGHS.
+#
+# Consider two Y vectors `y1 = [22, 37, 63]` and `y2 = [22, 54, 47]`. We clearly
+# want to return them in the order `y1`, `y2`, but if `y1[1] = 22+eps` then
+# we'll get these "round the wrong way" from the user's perspective, even though
+# it would be numerically correct.
+#
+# My solution is just to round these to the nearest `atol`. The main situation
+# that this would be confusing is when the objective is integer and we sort
+# wrongly because of 0.9999999 and 1.00000001 etc.
+function _sort!(
+    solutions::Vector{SolutionPoint},
+    sense::MOI.OptimizationSense;
+    atol::Float64,
+)
+    digits = max(0, round(Int, -log10(atol)))
+    rev = sense == MOI.MAX_SENSE
+    return sort!(solutions; by = p -> round.(p.y; digits), rev)
+end
+
+"""
+    filter_nondominated(
+        sense::MOI.OptimizationSense,
+        solutions::Vector{SolutionPoint};
+        atol::Float64 = 1e-6,
+    )::Vector{SolutionPoint}
+
+Return the subset of non-dominated points from `solutions` as a new vector.
+
+`atol` is used when comparing objective vectors elementwise. The use of `atol`
+avoids returning a large set of solution points that are practically equivalent
+but differ only by some small (less than `atol`) value.
+"""
+function filter_nondominated(
+    sense::MOI.OptimizationSense,
+    solutions::Vector{SolutionPoint};
+    atol::Float64 = 1e-6,
+)
+    nondominated_solutions = SolutionPoint[]
+    for candidate in solutions
+        if any(test -> _dominates(sense, test, candidate; atol), solutions)
+            # Point is dominated. Don't add
+        elseif any(test -> ≈(test.y, candidate.y; atol), nondominated_solutions)
+            # Point already added to nondominated solutions. Don't add
+        else
+            push!(nondominated_solutions, candidate)
+        end
+    end
+    _sort!(nondominated_solutions, sense; atol)
+    return nondominated_solutions
+end
+
+function _scalarise(f::MOI.VectorOfVariables, w::Vector{Float64})
+    @assert MOI.output_dimension(f) == length(w)
+    return MOI.ScalarAffineFunction(
+        [MOI.ScalarAffineTerm(w[i], f.variables[i]) for i in 1:length(w)],
+        0.0,
+    )
+end
+
+function _scalarise(f::MOI.VectorAffineFunction, w::Vector{Float64})
+    @assert MOI.output_dimension(f) == length(w)
+    constant = sum(w[i] * f.constants[i] for i in 1:length(w))
+    terms = MOI.ScalarAffineTerm{Float64}[
+        MOI.ScalarAffineTerm(
+            w[term.output_index] * term.scalar_term.coefficient,
+            term.scalar_term.variable,
+        ) for term in f.terms
+    ]
+    return MOI.ScalarAffineFunction(terms, constant)
+end
+
+function _scalarise(f::MOI.VectorQuadraticFunction, w::Vector{Float64})
+    @assert MOI.output_dimension(f) == length(w)
+    quad_terms = MOI.ScalarQuadraticTerm{Float64}[
+        MOI.ScalarQuadraticTerm(
+            w[term.output_index] * term.scalar_term.coefficient,
+            term.scalar_term.variable_1,
+            term.scalar_term.variable_2,
+        ) for term in f.quadratic_terms
+    ]
+    affine_terms = MOI.ScalarAffineTerm{Float64}[
+        MOI.ScalarAffineTerm(
+            w[term.output_index] * term.scalar_term.coefficient,
+            term.scalar_term.variable,
+        ) for term in f.affine_terms
+    ]
+    constant = sum(w[i] * f.constants[i] for i in 1:length(w))
+    return MOI.ScalarQuadraticFunction(quad_terms, affine_terms, constant)
+end
+
+function _scalarise(f::MOI.VectorNonlinearFunction, w::Vector{Float64})
+    scalars = map(zip(w, f.rows)) do (wi, fi)
+        return MOI.ScalarNonlinearFunction(:*, Any[wi, fi])
+    end
+    return MOI.ScalarNonlinearFunction(:+, scalars)
+end
+
+"""
+    abstract type AbstractAlgorithm end
+
+The base abtract type for solution algorithms.
+
+To define a new solution algorithm, define a subtype of `AbstractAlgorithm` and
+implement `MOA.optimize_multiobjective!`.
+"""
+abstract type AbstractAlgorithm end
+
+MOI.Utilities.map_indices(::Function, x::AbstractAlgorithm) = x
+
+"""
+    Optimizer(optimizer_factory)
+
+Create a new instance of a MultiObjectiveAlgorithms optimizer.
+
+`optimizer_factory` must define an inner optimizer constructor that MOA can use
+to solve the scalar-objective subproblems. The inner optimizer is constructed
+with:
+```julia
+MOI.instantiate(optimizer_factory; with_cache_type = Float64)
+```
+
+## Example
+
+```julia
+julia> using JuMP
+
+julia> import MultiObjectiveAlgorithms as MOA
+
+julia> import HiGHS
+
+julia> model = Model(() -> MOA.Optimizer(HiGHS.Optimizer))
+```
+"""
+mutable struct Optimizer <: MOI.AbstractOptimizer
+    inner::MOI.AbstractOptimizer
+    algorithm::Union{Nothing,AbstractAlgorithm}
+    f::Union{Nothing,MOI.AbstractVectorFunction}
+    solutions::Vector{SolutionPoint}
+    termination_status::MOI.TerminationStatusCode
+    silent::Bool
+    time_limit_sec::Union{Nothing,Float64}
+    allow_inner_interrupt::Bool
+    start_time::Float64
+    solve_time::Float64
+    ideal_point::Vector{Float64}
+    compute_ideal_point::Bool
+    subproblem_count::Int
+    solve_time_inner::Float64
+    optimizer_factory::Any
+
+    function Optimizer(optimizer_factory)
+        inner = MOI.instantiate(optimizer_factory; with_cache_type = Float64)
+        if MOI.supports(inner, MOI.Silent())
+            # Make the default for `SilentInner` true.
+            MOI.set(inner, MOI.Silent(), true)
+        end
+        return new(
+            inner,
+            nothing,
+            nothing,
+            SolutionPoint[],
+            MOI.OPTIMIZE_NOT_CALLED,
+            false,
+            nothing,
+            false,
+            NaN,
+            NaN,
+            Float64[],
+            _default(ComputeIdealPoint()),
+            0,
+            0.0,
+            optimizer_factory,
+        )
+    end
+end
+
+function MOI.empty!(model::Optimizer)
+    MOI.empty!(model.inner)
+    model.f = nothing
+    empty!(model.solutions)
+    model.termination_status = MOI.OPTIMIZE_NOT_CALLED
+    model.solve_time = NaN
+    model.start_time = NaN
+    empty!(model.ideal_point)
+    model.subproblem_count = 0
+    return
+end
+
+function MOI.is_empty(model::Optimizer)
+    return MOI.is_empty(model.inner) &&
+           model.f === nothing &&
+           isempty(model.solutions) &&
+           model.termination_status == MOI.OPTIMIZE_NOT_CALLED &&
+           isnan(model.solve_time) &&
+           isempty(model.ideal_point)
+end
+
+MOI.supports_incremental_interface(::Optimizer) = true
+
+function MOI.copy_to(dest::Optimizer, src::MOI.ModelLike)
+    return MOI.Utilities.default_copy_to(dest, src)
+end
+
+### Silent
+
+MOI.supports(::Optimizer, ::MOI.Silent) = true
+
+MOI.get(model::Optimizer, ::MOI.Silent) = model.silent
+
+function MOI.set(model::Optimizer, ::MOI.Silent, value::Bool)
+    model.silent = value
+    return
+end
+
+### SilentInner
+
+"""
+    SilentInner() <: MOI.AbstractOptimizerAttribute
+
+An optimizer attribute that controls whether the inner optimizer's `MOI.Silent`
+attribute.
+
+By default, this attribute is set to `true`. Set it to `false` to enable logging
+of the inner solver. In most cases, this will result in a large amount of output
+that is hard to interpret, but it may be helpful when debugging failed solves.
+"""
+struct SilentInner <: MOI.AbstractOptimizerAttribute end
+
+function MOI.supports(model::Optimizer, ::SilentInner)
+    return MOI.supports(model.inner, MOI.Silent())
+end
+
+function MOI.get(model::Optimizer, ::SilentInner)
+    return MOI.get(model.inner, MOI.Silent())
+end
+
+function MOI.set(model::Optimizer, ::SilentInner, value::Bool)
+    MOI.set(model.inner, MOI.Silent(), value)
+    return
+end
+
+### TimeLimitSec
+
+function MOI.supports(model::Optimizer, attr::MOI.TimeLimitSec)
+    return MOI.supports(model.inner, attr)
+end
+
+MOI.get(model::Optimizer, ::MOI.TimeLimitSec) = model.time_limit_sec
+
+function MOI.set(model::Optimizer, ::MOI.TimeLimitSec, value::Real)
+    model.time_limit_sec = Float64(value)
+    return
+end
+
+function MOI.set(model::Optimizer, ::MOI.TimeLimitSec, ::Nothing)
+    model.time_limit_sec = nothing
+    return
+end
+
+### AllowInnerInterrupt
+
+"""
+    AllowInnerInterrupt() <: MOI.AbstractOptimizerAttribute
+
+An optimizer attribute that controls whether the SIGINT (`[CTRL]+[C]`) are
+enabled during the solve of the inner optimization problems.
+
+By default, this attribute is set to `false`.
+
+!!! warning
+    This attribute should be used with caution. It is safe to set to `true` only
+    if the inner optimization has native support for safely interrupting a call
+    to `optimize!`. It is undefined behavior if you set this attribute to `true`
+    and you interrupt a solver that does not have support for safely
+    interrupting a solve.
+"""
+struct AllowInnerInterrupt <: MOI.AbstractOptimizerAttribute end
+
+MOI.supports(::Optimizer, ::AllowInnerInterrupt) = true
+
+MOI.get(model::Optimizer, ::AllowInnerInterrupt) = model.allow_inner_interrupt
+
+function MOI.set(model::Optimizer, ::AllowInnerInterrupt, value::Bool)
+    model.allow_inner_interrupt = value
+    return
+end
+
+### SolveTimeSec
+
+function MOI.get(model::Optimizer, ::MOI.SolveTimeSec)
+    return model.solve_time
+end
+
+### ObjectiveFunction
+
+function MOI.supports(
+    ::Optimizer,
+    ::MOI.ObjectiveFunction{<:MOI.AbstractScalarFunction},
+)
+    return false
+end
+
+function MOI.supports(
+    model::Optimizer,
+    ::MOI.ObjectiveFunction{F},
+) where {F<:MOI.AbstractVectorFunction}
+    G = MOI.Utilities.scalar_type(F)
+    H = MOI.Utilities.promote_operation(+, Float64, G, G)
+    return MOI.supports(model.inner, MOI.ObjectiveFunction{G}()) &&
+           MOI.supports(model.inner, MOI.ObjectiveFunction{H}())
+end
+
+const _ATTRIBUTES = Union{
+    MOI.AbstractConstraintAttribute,
+    MOI.AbstractModelAttribute,
+    MOI.AbstractOptimizerAttribute,
+    MOI.AbstractVariableAttribute,
+}
+
+### Algorithm
+
+"""
+    Algorithm() <: MOI.AbstractOptimizerAttribute
+
+An attribute to control the algorithm used by MOA.
+"""
+struct Algorithm <: MOI.AbstractOptimizerAttribute end
+
+MOI.supports(::Optimizer, ::Algorithm) = true
+
+MOI.get(model::Optimizer, ::Algorithm) = model.algorithm
+
+function MOI.set(model::Optimizer, ::Algorithm, alg::AbstractAlgorithm)
+    model.algorithm = alg
+    return
+end
+
+_default(::Algorithm) = Lexicographic()
+
+### AbstractAlgorithmAttribute
+
+"""
+    AbstractAlgorithmAttribute <: MOI.AbstractOptimizerAttribute
+
+A super-type for MOA-specific optimizer attributes.
+"""
+abstract type AbstractAlgorithmAttribute <: MOI.AbstractOptimizerAttribute end
+
+_default(::AbstractAlgorithm, attr::AbstractAlgorithmAttribute) = _default(attr)
+
+function MOI.supports(model::Optimizer, attr::AbstractAlgorithmAttribute)
+    return MOI.supports(model.algorithm, attr)
+end
+
+function MOI.set(model::Optimizer, attr::AbstractAlgorithmAttribute, value)
+    MOI.set(model.algorithm, attr, value)
+    return
+end
+
+function MOI.get(model::Optimizer, attr::AbstractAlgorithmAttribute)
+    return MOI.get(model.algorithm, attr)
+end
+
+"""
+    SolutionLimit() <: AbstractAlgorithmAttribute -> Int
+
+Terminate the algorithm once the set number of solutions have been found.
+
+Defaults to `typemax(Int)`.
+"""
+struct SolutionLimit <: AbstractAlgorithmAttribute end
+
+_default(::SolutionLimit) = typemax(Int)
+
+"""
+    ObjectivePriority(index::Int) <: AbstractAlgorithmAttribute -> Int
+
+Assign an `Int` priority to objective number `index`. This is most commonly
+used to group the objectives into sets of equal priorities. Greater numbers
+indicate higher priority.
+
+Defaults to `0`.
+"""
+struct ObjectivePriority <: AbstractAlgorithmAttribute
+    index::Int
+end
+
+_default(::ObjectivePriority) = 0
+
+"""
+    ObjectiveWeight(index::Int) <: AbstractAlgorithmAttribute -> Float64
+
+Assign a `Float64` weight to objective number `index`. This is most commonly
+used to scalarize a set of objectives using their weighted sum.
+
+Defaults to `1.0`.
+"""
+struct ObjectiveWeight <: AbstractAlgorithmAttribute
+    index::Int
+end
+
+_default(::ObjectiveWeight) = 1.0
+
+"""
+    ObjectiveRelativeTolerance(index::Int) <: AbstractAlgorithmAttribute -> Float64
+
+Assign a `Float64` tolerance to objective number `index`. This is most commonly
+used to constrain an objective to a range relative to the optimal objective
+value of that objective.
+
+Defaults to `0.0`.
+"""
+struct ObjectiveRelativeTolerance <: AbstractAlgorithmAttribute
+    index::Int
+end
+
+_default(::ObjectiveRelativeTolerance) = 0.0
+
+"""
+    ObjectiveAbsoluteTolerance(index::Int) <: AbstractAlgorithmAttribute -> Float64
+
+Assign a `Float64` tolerance to objective number `index`. This is most commonly
+used to constrain an objective to a range in absolute terms to the optimal
+objective value of that objective.
+
+Defaults to `0.0`.
+"""
+struct ObjectiveAbsoluteTolerance <: AbstractAlgorithmAttribute
+    index::Int
+end
+
+_default(::ObjectiveAbsoluteTolerance) = 0.0
+
+"""
+    EpsilonConstraintStep <: AbstractAlgorithmAttribute -> Float64
+
+The step `ε` to use in epsilon-constraint methods.
+
+Defaults to `1.0`.
+"""
+struct EpsilonConstraintStep <: AbstractAlgorithmAttribute end
+
+_default(::EpsilonConstraintStep) = 1.0
+
+"""
+    LexicographicAllPermutations <: AbstractAlgorithmAttribute -> Bool
+
+Controls whether to return the lexicographic solution for all permutations of
+the scalar objectives (when `true`), or only the solution corresponding to the
+lexicographic solution of the original objective function (when `false`).
+
+Defaults to `true`.
+"""
+struct LexicographicAllPermutations <: AbstractAlgorithmAttribute end
+
+_default(::LexicographicAllPermutations) = true
+
+"""
+    ComputeIdealPoint <: AbstractOptimizerAttribute -> Bool
+
+Controls whether to compute the ideal point.
+
+Defaults to true`.
+
+If this attribute is set to `true`, the ideal point can be queried using the
+`MOI.ObjectiveBound` attribute.
+
+Computing the ideal point requires as many solves as the dimension of the
+objective function. Thus, if you do not need the ideal point information, you
+can improve the performance of MOA by setting this attribute to `false`.
+"""
+struct ComputeIdealPoint <: MOI.AbstractOptimizerAttribute end
+
+_default(::ComputeIdealPoint) = true
+
+MOI.supports(::Optimizer, ::ComputeIdealPoint) = true
+
+function MOI.set(model::Optimizer, ::ComputeIdealPoint, value::Bool)
+    model.compute_ideal_point = value
+    return
+end
+
+MOI.get(model::Optimizer, ::ComputeIdealPoint) = model.compute_ideal_point
+
+### SubproblemCount
+
+"""
+    SubproblemCount <: AbstractModelAttribute -> Int
+
+A result attribute for querying the total number of subproblem solves by an
+algorithm.
+"""
+struct SubproblemCount <: MOI.AbstractModelAttribute end
+
+MOI.is_set_by_optimize(::SubproblemCount) = true
+
+MOI.get(model::Optimizer, ::SubproblemCount) = model.subproblem_count
+
+### RawOptimizerAttribute
+
+function MOI.supports(model::Optimizer, attr::MOI.RawOptimizerAttribute)
+    return MOI.supports(model.inner, attr)
+end
+
+function MOI.set(model::Optimizer, attr::MOI.RawOptimizerAttribute, value)
+    MOI.set(model.inner, attr, value)
+    return
+end
+
+function MOI.get(model::Optimizer, attr::MOI.RawOptimizerAttribute)
+    return MOI.get(model.inner, attr)
+end
+
+### AbstractOptimizerAttribute
+
+function MOI.supports(model::Optimizer, arg::MOI.AbstractOptimizerAttribute)
+    return MOI.supports(model.inner, arg)
+end
+
+function MOI.set(model::Optimizer, attr::MOI.AbstractOptimizerAttribute, value)
+    MOI.set(model.inner, attr, value)
+    return
+end
+
+function MOI.get(model::Optimizer, attr::MOI.AbstractOptimizerAttribute)
+    return MOI.get(model.inner, attr)
+end
+
+function MOI.get(model::Optimizer, ::MOI.SolverName)
+    alg = typeof(something(model.algorithm, _default(Algorithm())))
+    inner = MOI.get(model.inner, MOI.SolverName())
+    return "MOA[algorithm=$alg, optimizer=$inner]"
+end
+
+### AbstractModelAttribute
+
+function MOI.supports(model::Optimizer, arg::MOI.AbstractModelAttribute)
+    return MOI.supports(model.inner, arg)
+end
+
+### AbstractVariableAttribute
+
+function MOI.is_valid(model::Optimizer, x::MOI.VariableIndex)
+    return MOI.is_valid(model.inner, x)
+end
+
+function MOI.supports(
+    model::Optimizer,
+    arg::MOI.AbstractVariableAttribute,
+    ::Type{MOI.VariableIndex},
+)
+    return MOI.supports(model.inner, arg, MOI.VariableIndex)
+end
+
+function MOI.set(
+    model::Optimizer,
+    attr::MOI.AbstractVariableAttribute,
+    indices::Vector{<:MOI.VariableIndex},
+    args::Vector{T},
+) where {T}
+    MOI.set.(model, attr, indices, args)
+    return
+end
+
+### AbstractConstraintAttribute
+
+function MOI.is_valid(model::Optimizer, ci::MOI.ConstraintIndex)
+    return MOI.is_valid(model.inner, ci)
+end
+
+function MOI.supports(
+    model::Optimizer,
+    arg::MOI.AbstractConstraintAttribute,
+    ::Type{MOI.ConstraintIndex{F,S}},
+) where {F<:MOI.AbstractFunction,S<:MOI.AbstractSet}
+    return MOI.supports(model.inner, arg, MOI.ConstraintIndex{F,S})
+end
+
+function MOI.set(
+    model::Optimizer,
+    attr::MOI.AbstractConstraintAttribute,
+    indices::Vector{<:MOI.ConstraintIndex},
+    args::Vector{T},
+) where {T}
+    MOI.set.(model, attr, indices, args)
+    return
+end
+
+function MOI.set(model::Optimizer, attr::_ATTRIBUTES, args...)
+    return MOI.set(model.inner, attr, args...)
+end
+
+function MOI.get(model::Optimizer, attr::_ATTRIBUTES, args...)
+    if MOI.is_set_by_optimize(attr)
+        msg = "MOA does not support querying this attribute."
+        throw(MOI.GetAttributeNotAllowed(attr, msg))
+    end
+    return MOI.get(model.inner, attr, args...)
+end
+
+function MOI.get(model::Optimizer, attr::_ATTRIBUTES, arg::Vector{T}) where {T}
+    if MOI.is_set_by_optimize(attr)
+        msg = "MOA does not support querying this attribute."
+        throw(MOI.GetAttributeNotAllowed(attr, msg))
+    end
+    return MOI.get.(model, attr, arg)
+end
+
+function MOI.get(model::Optimizer, ::Type{MOI.VariableIndex}, args...)
+    return MOI.get(model.inner, MOI.VariableIndex, args...)
+end
+
+function MOI.get(model::Optimizer, T::Type{<:MOI.ConstraintIndex}, args...)
+    return MOI.get(model.inner, T, args...)
+end
+
+MOI.add_variable(model::Optimizer) = MOI.add_variable(model.inner)
+
+MOI.add_variables(model::Optimizer, n::Int) = MOI.add_variables(model.inner, n)
+
+function MOI.supports_constraint(
+    model::Optimizer,
+    F::Type{<:MOI.AbstractFunction},
+    S::Type{<:MOI.AbstractSet},
+)
+    return MOI.supports_constraint(model.inner, F, S)
+end
+
+function MOI.add_constraint(
+    model::Optimizer,
+    f::MOI.AbstractFunction,
+    s::MOI.AbstractSet,
+)
+    return MOI.add_constraint(model.inner, f, s)
+end
+
+function MOI.set(
+    model::Optimizer,
+    ::MOI.ObjectiveFunction{F},
+    f::F,
+) where {F<:MOI.AbstractVectorFunction}
+    model.f = f
+    return
+end
+
+MOI.get(model::Optimizer, ::MOI.ObjectiveFunctionType) = typeof(model.f)
+
+MOI.get(model::Optimizer, ::MOI.ObjectiveFunction) = model.f
+
+function MOI.get(model::Optimizer, attr::MOI.ListOfModelAttributesSet)
+    ret = MOI.get(model.inner, attr)
+    if model.f !== nothing
+        F = MOI.get(model, MOI.ObjectiveFunctionType())
+        push!(ret, MOI.ObjectiveFunction{F}())
+    end
+    return ret
+end
+
+function MOI.delete(model::Optimizer, x::MOI.VariableIndex)
+    if model.f isa MOI.VectorNonlinearFunction
+        throw(MOI.DeleteNotAllowed(x))
+    end
+    MOI.delete(model.inner, x)
+    if model.f !== nothing
+        model.f = MOI.Utilities.remove_variable(model.f, x)
+        if MOI.output_dimension(model.f) == 0
+            model.f = nothing
+        end
+    end
+    return
+end
+
+function MOI.delete(model::Optimizer, ci::MOI.ConstraintIndex)
+    MOI.delete(model.inner, ci)
+    return
+end
+
+function _call_with_sigint_if(f::Function, enable_sigint::Bool)
+    if enable_sigint
+        return reenable_sigint(f)
+    end
+    return f()
+end
+
+"""
+    optimize_inner!(model::Optimizer)
+
+A function that must be called instead of `MOI.optimize!(model.inner)` because
+it also increments `subproblem_count` and `solve_time_inner`.
+
+## Usage
+
+This function is part of the public developer API. You should not call it from
+user-facing code. You may use it when implementing new algorithms in third-party
+packages.
+"""
+function optimize_inner!(model::Optimizer)
+    start_time = time()
+    # If AllowInnerInterrupt=true, there are two cases that can happen:
+    #
+    # 1. the interrupt is gracefully caught by the inner optimizer, in which
+    #    case no error is thrown. The interrupt is handled by the regular
+    #    termination status check, just as it would for any other problematic
+    #    solve.
+    #
+    # 2. the interrupt is not gracefully caught, and an InterruptException is
+    #    thrown. Bad user. They shouldn't have set AllowInnerInterrupt.
+    _call_with_sigint_if(MOI.get(model, AllowInnerInterrupt())) do
+        return MOI.optimize!(model.inner)
+    end
+    model.solve_time_inner += time() - start_time
+    model.subproblem_count += 1
+    return
+end
+
+function _compute_ideal_point(model::Optimizer)
+    for (i, f) in enumerate(MOI.Utilities.eachscalar(model.f))
+        if _check_premature_termination(model) !== nothing
+            return
+        end
+        if !isnan(model.ideal_point[i])
+            continue  # The algorithm already updated this information
+        end
+        MOI.set(model.inner, MOI.ObjectiveFunction{typeof(f)}(), f)
+        optimize_inner!(model)
+        status = MOI.get(model.inner, MOI.TerminationStatus())
+        if _is_scalar_status_optimal(status)
+            model.ideal_point[i] = MOI.get(model.inner, MOI.ObjectiveValue())
+        end
+    end
+    return
+end
+
+"""
+    minimize_multiobjective!(
+        algorithm::AbstractAlgorithm,
+        model::Optimizer,
+    )::Union{MOI.TerminationStatusCode,Union{Nothing,Vector{SolutionPoint}}}
+
+This function is equivalent to `optimize_multiobjective!`, except that you may
+assume that the problem is a minimization problem. This can make implementing
+new solution algorithms simpler.
+
+## Usage
+
+This function is part of the public developer API. You should not call it from
+user-facing code. You may use it when implementing new algorithms in third-party
+packages.
+"""
+function minimize_multiobjective!(alg::AbstractAlgorithm, model::Optimizer)
+    return minimize_multiobjective!(alg, model, model.inner, model.f)
+end
+
+"""
+    optimize_multiobjective!(
+        algorithm::AbstractAlgorithm,
+        model::Optimizer,
+    )::Tuple{MOI.TerminationStatusCode,Union{Nothing,Vector{SolutionPoint}}}
+
+Optimize `model` using `algorithm` and return a solution tuple comprised of a
+`MOI.TerminationStatusCode` explaining why the solver stopped, and a vector of
+`SolutionPoint` (or `nothing`, if something went wrong).
+
+## Usage
+
+This function is part of the public developer API. You should not call it from
+user-facing code. You may use it when implementing new algorithms in third-party
+packages.
+"""
+function optimize_multiobjective!(
+    algorithm::AbstractAlgorithm,
+    model::Optimizer,
+)
+    sense = MOI.get(model.inner, MOI.ObjectiveSense())
+    if sense == MOI.FEASIBILITY_SENSE
+        return MOI.INVALID_MODEL, nothing
+    elseif sense == MOI.MAX_SENSE
+        old_obj = copy(model.f)
+        neg_obj = MOI.Utilities.operate(-, Float64, model.f)
+        MOI.set(model, MOI.ObjectiveFunction{typeof(neg_obj)}(), neg_obj)
+        MOI.set(model, MOI.ObjectiveSense(), MOI.MIN_SENSE)
+        status, solutions = minimize_multiobjective!(algorithm, model)
+        MOI.set(model, MOI.ObjectiveFunction{typeof(old_obj)}(), old_obj)
+        MOI.set(model, MOI.ObjectiveSense(), MOI.MAX_SENSE)
+        if solutions !== nothing
+            solutions = [SolutionPoint(s.x, -s.y) for s in solutions]
+        end
+        model.ideal_point *= -1
+        return status, solutions
+    end
+    return minimize_multiobjective!(algorithm, model)
+end
+
+function _check_interrupt(f)
+    try
+        return reenable_sigint(f)
+    catch ex
+        if !(ex isa InterruptException)
+            rethrow(ex)
+        end
+        return MOI.INTERRUPTED
+    end
+end
+
+function _check_premature_termination(model::Optimizer)
+    return _check_interrupt() do
+        time_limit = MOI.get(model, MOI.TimeLimitSec())
+        if time_limit !== nothing
+            time_remaining = time_limit - (time() - model.start_time)
+            if time_remaining <= 0
+                return MOI.TIME_LIMIT
+            end
+            if MOI.supports(model.inner, MOI.TimeLimitSec())
+                MOI.set(model.inner, MOI.TimeLimitSec(), time_remaining)
+            end
+        end
+        return
+    end
+end
+
+function MOI.optimize!(model::Optimizer)
+    disable_sigint(() -> _optimize!(model))
+    return
+end
+
+function _print_header(io::IO, model::Optimizer)
+    rule = "-"^(7 + 13 * (MOI.output_dimension(model.f) + 1))
+    println(io, rule)
+    println(io, "        MultiObjectiveAlgorithms.jl")
+    println(io, rule)
+    println(
+        io,
+        "Algorithm: ",
+        replace(
+            string(typeof(model.algorithm)),
+            "MultiObjectiveAlgorithms." => "",
+        ),
+    )
+    println(io, rule)
+    print(io, "solve #")
+    for i in 1:MOI.output_dimension(model.f)
+        print(io, lpad("Obj. $i  ", 13))
+    end
+    println(io, "     Time    ")
+    println(io, rule)
+    return
+end
+
+function _print_footer(io::IO, model::Optimizer)
+    rule = "-"^(7 + 13 * (MOI.output_dimension(model.f) + 1))
+    println(io, rule)
+    println(io, "termination_status: ", model.termination_status)
+    println(io, "result_count: ", length(model.solutions))
+    println(io)
+    println(io, "Total solve time:         ", _format(model.solve_time))
+    println(
+        io,
+        "Time spent in subproblems:",
+        _format(model.solve_time_inner),
+        " (",
+        round(Int, 100 * (model.solve_time_inner / model.solve_time)),
+        "%)",
+    )
+    println(io, "Number of subproblems:     ", model.subproblem_count)
+    println(io, rule)
+    return
+end
+
+"""
+    _log_subproblem_solve(model::Optimizer, variables::Vector{MOI.VariableIndex})
+
+Log the solution. We don't have a pre-computed point, so compute one from the
+variable values.
+"""
+function _log_subproblem_solve(model::Optimizer, arg)
+    if !model.silent
+        _log_subproblem_inner(model, arg)
+    end
+    return
+end
+
+# Variables; compute the associated Y
+function _log_subproblem_inner(model::Optimizer, x::Vector{MOI.VariableIndex})
+    _, Y = _compute_point(model, x, model.f)
+    _log_subproblem_solve(model, Y)
+    return
+end
+
+# We have a pre-computed point.
+function _log_subproblem_inner(model::Optimizer, Y::Vector)
+    print(_format(model.subproblem_count), "  ")
+    for y in Y
+        print(" ", _format(y))
+    end
+    println(" ", _format(time() - model.start_time))
+    return
+end
+
+# Assume the subproblem failed to solve.
+function _log_subproblem_inner(model::Optimizer, msg::String)
+    print(_format(model.subproblem_count), "  ")
+    print(rpad(msg, 13 * MOI.output_dimension(model.f)))
+    println(" ", _format(time() - model.start_time))
+    return
+end
+
+_format(x::Int) = Printf.@sprintf("%5d", x)
+
+_format(x::Float64) = Printf.@sprintf("% .5e", x)
+
+function _optimize!(model::Optimizer)
+    model.start_time = time()
+    empty!(model.solutions)
+    model.termination_status = MOI.OPTIMIZE_NOT_CALLED
+    model.subproblem_count = 0
+    model.solve_time_inner = 0.0
+    if model.f === nothing
+        model.termination_status = MOI.INVALID_MODEL
+        empty!(model.ideal_point)
+        return
+    end
+    if !model.silent
+        _print_header(stdout, model)
+    end
+    # We need to clear the ideal point prior to starting the solve. Algorithms
+    # may update this during the solve, otherwise we will update it at the end.
+    model.ideal_point = fill(NaN, MOI.output_dimension(model.f))
+    algorithm = something(model.algorithm, _default(Algorithm()))
+    status, solutions = optimize_multiobjective!(algorithm, model)
+    model.termination_status = status
+    if solutions !== nothing
+        sense = MOI.get(model, MOI.ObjectiveSense())
+        model.solutions = filter_nondominated(sense, solutions)
+    end
+    if MOI.get(model, ComputeIdealPoint())
+        _compute_ideal_point(model)
+    end
+    if MOI.supports(model.inner, MOI.TimeLimitSec())
+        MOI.set(model.inner, MOI.TimeLimitSec(), nothing)
+    end
+    model.solve_time = time() - model.start_time
+    if !model.silent
+        _print_footer(stdout, model)
+    end
+    return
+end
+
+MOI.get(model::Optimizer, ::MOI.ResultCount) = length(model.solutions)
+
+function MOI.get(model::Optimizer, ::MOI.RawStatusString)
+    n = MOI.get(model, MOI.ResultCount())
+    return "Solve complete. Found $n solution(s)"
+end
+
+function MOI.get(
+    model::Optimizer,
+    attr::MOI.VariablePrimal,
+    x::MOI.VariableIndex,
+)
+    sol = model.solutions[attr.result_index]
+    return sol.x[x]
+end
+
+function MOI.get(
+    model::Optimizer,
+    attr::MOI.VariablePrimal,
+    x::Vector{MOI.VariableIndex},
+)
+    return MOI.get.(model, attr, x)
+end
+
+function MOI.get(model::Optimizer, attr::MOI.ObjectiveValue)
+    return model.solutions[attr.result_index].y
+end
+
+MOI.get(model::Optimizer, ::MOI.ObjectiveBound) = model.ideal_point
+
+MOI.get(model::Optimizer, ::MOI.TerminationStatus) = model.termination_status
+
+function MOI.get(model::Optimizer, attr::MOI.PrimalStatus)
+    if 1 <= attr.result_index <= length(model.solutions)
+        return MOI.FEASIBLE_POINT
+    end
+    return MOI.NO_SOLUTION
+end
+
+MOI.get(::Optimizer, ::MOI.DualStatus) = MOI.NO_SOLUTION
+
+function _compute_point(
+    model::Optimizer,
+    variables::Vector{MOI.VariableIndex},
+    f,
+)
+    X = Dict{MOI.VariableIndex,Float64}(
+        x => MOI.get(model.inner, MOI.VariablePrimal(), x) for x in variables
+    )
+    Y = MOI.Utilities.eval_variables(Base.Fix1(getindex, X), model, f)
+    return X, Y
+end
+
+function _is_scalar_status_feasible_point(status::MOI.ResultStatusCode)
+    return status == MOI.FEASIBLE_POINT
+end
+
+function _is_scalar_status_optimal(status::MOI.TerminationStatusCode)
+    return status == MOI.OPTIMAL || status == MOI.LOCALLY_SOLVED
+end
+
+function _is_scalar_status_optimal(model::Optimizer)
+    status = MOI.get(model.inner, MOI.TerminationStatus())
+    return _is_scalar_status_optimal(status)
+end
+
+function _warn_on_nonfinite_anti_ideal(algorithm, sense, index)
+    alg = string(typeof(algorithm))
+    direction = sense == MOI.MIN_SENSE ? "above" : "below"
+    bound = sense == MOI.MIN_SENSE ? "upper" : "lower"
+    @warn(
+        "Unable to solve the model using the `$alg` algorithm because the " *
+        "anti-ideal point of objective $index is not bounded $direction, and the " *
+        "algorithm requires a finitely bounded objective domain. The easiest " *
+        "way to fix this is to add objective $index as a constraint with a " *
+        "finite $bound. Alteratively, ensure that all of your decision " *
+        "variables have finite lower and upper bounds."
+    )
+    return
+end
+
+function _project(x::Vector{Float64}, axis::Int)
+    return [x[i] for i in 1:length(x) if i != axis]
+end
+
+for file in readdir(joinpath(@__DIR__, "algorithms"))
+    # The check for .jl is necessary because some users may have other files
+    # like .cov from running code coverage. See JuMP.jl#3746.
+    if endswith(file, ".jl")
+        include(joinpath(@__DIR__, "algorithms", file))
+    end
+end
+
+# MOA exports everything except internal symbols, which are defined as those
+# whose name starts with an underscore. If you don't want all of these symbols
+# in your environment, then use `import` instead of `using`.
+
+# Do not add MOA-defined symbols to this exclude list. Instead, rename them with
+# an underscore.
+const _EXCLUDE = Symbol[Symbol(@__MODULE__), :eval, :include]
+
+for sym in names(@__MODULE__; all = true)
+    if sym in _EXCLUDE || startswith("$sym", "_") || !Base.isidentifier(sym)
+        continue
+    end
+    @eval export $sym
+end
+
+end  # module
