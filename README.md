@@ -9,7 +9,7 @@ that were used in the research reported on in the paper
 [MultiObjectiveAlgorithms.jl: a Julia package for solving multi-objective optimization problems](https://doi.org/10.1287/ijoc.2025.1449) by Oscar Dowson, Xavier Gandibleux, and Gökhan Kof.
 
 The snapshot is based on
-[this SHA](https://github.com/jump-dev/MultiObjectiveAlgorithms.jl/commit/70cb3fdb112c6706efd85a88e20bfeca76c47f42)
+[this SHA](https://github.com/jump-dev/MultiObjectiveAlgorithms.jl/commit/fcea8f7437015b0aabb5fa1898f299ceee0bbb82)
 in the development repository.
 
 **Important: This code is being developed on an on-going basis at
