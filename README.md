@@ -9,7 +9,7 @@ that were used in the research reported on in the paper
 [MultiObjectiveAlgorithms.jl: a Julia package for solving multi-objective optimization problems](https://doi.org/10.1287/ijoc.2025.1449) by Oscar Dowson, Xavier Gandibleux, and Gökhan Kof.
 
 The snapshot is based on
-[this SHA](https://github.com/jump-dev/MultiObjectiveAlgorithms.jl/commit/4b78a85711f8a9b46712f9c7dcc88cb5116ede89)
+[this SHA](https://github.com/jump-dev/MultiObjectiveAlgorithms.jl/commit/fcea8f7437015b0aabb5fa1898f299ceee0bbb82)
 in the development repository.
 
 **Important: This code is being developed on an on-going basis at
@@ -28,10 +28,10 @@ https://doi.org/10.1287/ijoc.2025.1449.cd
 Below is the BibTex for citing this snapshot of the repository.
 
 ```
-@misc{DowsonMathOptAI,
-  author =        {Dowson, Oscar and Gandibleux, Xavier and Kof, {G{\"o}khan},
+@misc{DowsonMOA,
+  author =        {Dowson, Oscar and Gandibleux, Xavier and Kof, G{\"o}khan},
   publisher =     {INFORMS Journal on Computing},
-  title =         {MultiObjectiveAlgorithms.jl: a Julia package for solving multi-objective optimization problems},
+  title =         {{MultiObjectiveAlgorithms.jl: a Julia package for solving multi-objective optimization problems}},
   year =          {2026},
   doi =           {10.1287/ijoc.2025.1449.cd},
   url =           {https://github.com/INFORMSJoC/2025.1449},
@@ -134,8 +134,10 @@ the solution process.
  * `MOA.SolutionLimit()`
  * `MOI.TimeLimitSec()`
 
-Query the number of scalar subproblems that were solved using
+There are also the following result attributes that can be queried after the
+solve:
 
+ * `MOA.SolveTimeInner()`
  * `MOA.SubproblemCount()`
 
 For example:
